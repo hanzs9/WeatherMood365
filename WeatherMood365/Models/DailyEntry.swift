@@ -9,6 +9,7 @@ struct DailyEntry: Identifiable, Codable, Equatable {
     var photoFilename: String?
     var weather: WeatherSnapshot?
     var photoLocation: PhotoLocation?
+    var updatedAt: Date
 
     init(
         id: UUID = UUID(),
@@ -17,7 +18,8 @@ struct DailyEntry: Identifiable, Codable, Equatable {
         note: String = "",
         photoFilename: String? = nil,
         weather: WeatherSnapshot? = nil,
-        photoLocation: PhotoLocation? = nil
+        photoLocation: PhotoLocation? = nil,
+        updatedAt: Date = Date()
     ) {
         self.id = id
         self.date = date
@@ -26,6 +28,32 @@ struct DailyEntry: Identifiable, Codable, Equatable {
         self.photoFilename = photoFilename
         self.weather = weather
         self.photoLocation = photoLocation
+        self.updatedAt = updatedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case date
+        case mood
+        case note
+        case photoFilename
+        case weather
+        case photoLocation
+        case updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        date = try container.decode(Date.self, forKey: .date)
+        mood = try container.decode(Mood.self, forKey: .mood)
+        note = try container.decode(String.self, forKey: .note)
+        photoFilename = try container.decodeIfPresent(String.self, forKey: .photoFilename)
+        weather = try container.decodeIfPresent(WeatherSnapshot.self, forKey: .weather)
+        photoLocation = try container.decodeIfPresent(PhotoLocation.self, forKey: .photoLocation)
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt)
+            ?? weather?.fetchedAt
+            ?? date
     }
 }
 
@@ -145,6 +173,61 @@ struct WeatherSnapshot: Codable, Equatable {
     var windSpeed: Double
     var weatherCode: Int
     var fetchedAt: Date
+    var visibility: Double?
+    var aqi: Double?
+    var aerosolOpticalDepth: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case temperature
+        case windSpeed
+        case weatherCode
+        case fetchedAt
+        case visibility
+        case aqi
+        case europeanAQI
+        case aerosolOpticalDepth
+    }
+
+    init(
+        temperature: Double,
+        windSpeed: Double,
+        weatherCode: Int,
+        fetchedAt: Date,
+        visibility: Double? = nil,
+        aqi: Double? = nil,
+        aerosolOpticalDepth: Double? = nil
+    ) {
+        self.temperature = temperature
+        self.windSpeed = windSpeed
+        self.weatherCode = weatherCode
+        self.fetchedAt = fetchedAt
+        self.visibility = visibility
+        self.aqi = aqi
+        self.aerosolOpticalDepth = aerosolOpticalDepth
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        temperature = try container.decode(Double.self, forKey: .temperature)
+        windSpeed = try container.decode(Double.self, forKey: .windSpeed)
+        weatherCode = try container.decode(Int.self, forKey: .weatherCode)
+        fetchedAt = try container.decode(Date.self, forKey: .fetchedAt)
+        visibility = try container.decodeIfPresent(Double.self, forKey: .visibility)
+        aqi = try container.decodeIfPresent(Double.self, forKey: .aqi)
+            ?? container.decodeIfPresent(Double.self, forKey: .europeanAQI)
+        aerosolOpticalDepth = try container.decodeIfPresent(Double.self, forKey: .aerosolOpticalDepth)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(temperature, forKey: .temperature)
+        try container.encode(windSpeed, forKey: .windSpeed)
+        try container.encode(weatherCode, forKey: .weatherCode)
+        try container.encode(fetchedAt, forKey: .fetchedAt)
+        try container.encodeIfPresent(visibility, forKey: .visibility)
+        try container.encodeIfPresent(aqi, forKey: .aqi)
+        try container.encodeIfPresent(aerosolOpticalDepth, forKey: .aerosolOpticalDepth)
+    }
 
     var summary: String {
         switch weatherCode {
@@ -171,5 +254,27 @@ struct WeatherSnapshot: Codable, Equatable {
         case 95, 96, 99: "cloud.bolt.rain.fill"
         default: "cloud.fill"
         }
+    }
+
+    var needsDetailBackfill: Bool {
+        visibility == nil || aqi == nil || aerosolOpticalDepth == nil
+    }
+
+    var visibilityText: String {
+        guard let visibility else { return "未记录" }
+        if visibility >= 1000 {
+            return String(format: "%.1f km", visibility / 1000)
+        }
+        return String(format: "%.0f m", visibility)
+    }
+
+    var aqiText: String {
+        guard let aqi else { return "未记录" }
+        return "\(Int(aqi.rounded()))"
+    }
+
+    var aerosolOpticalDepthText: String {
+        guard let aerosolOpticalDepth else { return "未记录" }
+        return String(format: "%.2f", aerosolOpticalDepth)
     }
 }

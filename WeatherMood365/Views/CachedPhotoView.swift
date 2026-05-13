@@ -55,11 +55,24 @@ struct CachedPhotoView<Placeholder: View>: View {
     }
 }
 
+private actor KeyTracker {
+    private var urlKeys: [String: Set<String>] = [:]
+
+    func addKey(_ key: String, for urlPath: String) {
+        urlKeys[urlPath, default: []].insert(key)
+    }
+
+    func removeKeys(for urlPath: String) -> Set<String> {
+        urlKeys.removeValue(forKey: urlPath) ?? []
+    }
+}
+
 final class PhotoImageCache: @unchecked Sendable {
     static let shared = PhotoImageCache()
 
     private let cache = NSCache<NSString, UIImage>()
     private let fileManager = FileManager.default
+    private let keyTracker = KeyTracker()
 
     private init() {
         cache.countLimit = 240
@@ -79,22 +92,28 @@ final class PhotoImageCache: @unchecked Sendable {
             return cached
         }
 
-        return await Task.detached(priority: .userInitiated) { [self] in
-            let maxPixelSize = max(targetSize.width, targetSize.height) * scale
-            let image = Self.downsampledImage(at: url, maxPixelSize: maxPixelSize)
-                ?? UIImage(contentsOfFile: url.path)
+        let maxPixelSize = max(targetSize.width, targetSize.height) * scale
+        let image = Self.downsampledImage(at: url, maxPixelSize: maxPixelSize)
+            ?? UIImage(contentsOfFile: url.path)
 
-            if let image {
-                let cost = image.cgImage.map { $0.bytesPerRow * $0.height } ?? 0
-                cache.setObject(image, forKey: key, cost: cost)
-            }
+        if let image {
+            let cost = image.cgImage.map { $0.bytesPerRow * $0.height } ?? 0
+            cache.setObject(image, forKey: key, cost: cost)
+            await keyTracker.addKey(key as String, for: url.path)
+        }
 
-            return image
-        }.value
+        return image
     }
 
     func removeImages(for url: URL) {
-        cache.removeAllObjects()
+        Task {
+            let keys = await keyTracker.removeKeys(for: url.path)
+            await MainActor.run {
+                for key in keys {
+                    cache.removeObject(forKey: key as NSString)
+                }
+            }
+        }
     }
 
     private static func downsampledImage(at url: URL, maxPixelSize: CGFloat) -> UIImage? {

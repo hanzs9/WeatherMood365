@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    @EnvironmentObject private var store: EntryStore
     @State private var selectedTab: AppTab = .today
     @State private var calendarJumpToken = 0
 
@@ -18,11 +19,20 @@ struct ContentView: View {
                 }
                 .tag(AppTab.calendar)
 
-            LocationMapView()
+            ReviewView()
                 .tabItem {
-                    Label("地图", systemImage: "map")
+                    Label("回顾", systemImage: "chart.pie.fill")
                 }
-                .tag(AppTab.map)
+                .tag(AppTab.review)
+
+            SettingsView()
+                .tabItem {
+                    Label("设置", systemImage: "gearshape.fill")
+                }
+                .tag(AppTab.settings)
+        }
+        .task {
+            await ReminderService.shared.syncReminder(with: store)
         }
     }
 
@@ -42,7 +52,8 @@ struct ContentView: View {
 private enum AppTab: Hashable {
     case today
     case calendar
-    case map
+    case review
+    case settings
 }
 
 private struct TodayView: View {
@@ -67,15 +78,15 @@ private struct TodayView: View {
                         } label: {
                             Label(todayEntry == nil ? "记录今天" : "更新今天", systemImage: "camera.fill")
                                 .font(.headline)
-                                .foregroundStyle(.black)
+                                .foregroundStyle(Color.black)
                                 .frame(maxWidth: .infinity)
                                 .frame(height: 52)
                                 .background(
                                     RoundedRectangle(cornerRadius: 16)
-                                        .fill(Color(red: 1.0, green: 0.82, blue: 0.24))
+                                        .fill(Color.brandYellow)
                                 )
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.pressableCard(cornerRadius: 16, pressedScale: 0.98, overlayColor: .black.opacity(0.1)))
                     }
                     .listRowInsets(EdgeInsets(top: 16, leading: 16, bottom: 16, trailing: 16))
                 }
@@ -101,6 +112,7 @@ private struct TodayView: View {
                 }
             }
             .navigationTitle("今天")
+            .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(isPresented: $isCapturedEditorActive) {
                 EntryEditorView(entry: todayEntry ?? DailyEntry(), initialPickedPhoto: pendingCapturedPhoto, shouldFetchCurrentLocationForInitialPhoto: true)
             }
@@ -153,14 +165,21 @@ private struct TodayView: View {
                             .lineLimit(1)
 
                         if let weather = todayEntry.weather {
-                            HStack(spacing: 5) {
-                                Image(systemName: weather.symbol)
-                                    .symbolRenderingMode(.hierarchical)
-                                    .font(.system(size: 15, weight: .semibold))
-                                    .frame(width: 20, height: 20)
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 5) {
+                                    Image(systemName: weather.symbol)
+                                        .symbolRenderingMode(.hierarchical)
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .frame(width: 20, height: 20)
 
-                                Text("\(weather.summary) \(weather.temperature, specifier: "%.0f")°C")
+                                    Text("\(weather.summary) \(weather.temperature, specifier: "%.0f")°C")
+                                        .lineLimit(1)
+                                }
+
+                                Text("AQI \(weather.aqiText)  ·  能见度 \(weather.visibilityText)  ·  AOD \(weather.aerosolOpticalDepthText)")
+                                    .font(.caption)
                                     .lineLimit(1)
+                                    .minimumScaleFactor(0.9)
                             }
                         }
                     }

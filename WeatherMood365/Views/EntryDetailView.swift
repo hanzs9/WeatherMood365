@@ -14,6 +14,8 @@ struct EntryDetailView: View {
     @State private var saveMessage: String?
     @State private var resolvedLocationText: String?
     @State private var detailImage: UIImage?
+    @State private var isDeletingEntry = false
+    @State private var isBackfillingWeatherDetails = false
 
     private var entry: DailyEntry? {
         store.entry(for: date)
@@ -54,14 +56,20 @@ struct EntryDetailView: View {
 
                 if let weather = entry.weather {
                     Section("天气") {
-                        Label {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("\(weather.summary) \(weather.temperature, specifier: "%.0f")°C")
-                                    .font(.headline)
+                        VStack(alignment: .leading, spacing: 14) {
+                            Label {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("\(weather.summary) \(weather.temperature, specifier: "%.0f")°C")
+                                        .font(.headline)
+                                }
+                            } icon: {
+                                Image(systemName: weather.symbol)
+                                    .foregroundStyle(.blue)
                             }
-                        } icon: {
-                            Image(systemName: weather.symbol)
-                                .foregroundStyle(.blue)
+
+                            Divider()
+
+                            WeatherDetailMetricsView(weather: weather, isRefreshing: isBackfillingWeatherDetails)
                         }
                     }
                 }
@@ -92,6 +100,10 @@ struct EntryDetailView: View {
                 .listRowBackground(Color.clear)
             }
         }
+        .opacity(isDeletingEntry ? 0 : 1)
+        .scaleEffect(isDeletingEntry ? 0.985 : 1)
+        .animation(.easeInOut(duration: 0.2), value: isDeletingEntry)
+        .allowsHitTesting(!isDeletingEntry)
         .navigationTitle(date.formatted(.dateTime.month().day()))
         .navigationBarTitleDisplayMode(.inline)
         .navigationDestination(isPresented: $isEditorActive) {
@@ -99,21 +111,19 @@ struct EntryDetailView: View {
                 EntryEditorView(entry: entry, allowsDateEditing: false, titleOverride: "修改记录")
             }
         }
-        .overlay {
-            if isDeleteConfirmationPresented, let entry {
-                DeleteConfirmationOverlay(
-                    onCancel: {
-                        withAnimation(.easeOut(duration: 0.18)) {
-                            isDeleteConfirmationPresented = false
-                        }
-                    },
-                    onDelete: {
-                        store.delete(entry)
-                        dismiss()
+        .alert("删除这条记录？", isPresented: $isDeleteConfirmationPresented) {
+            Button("取消", role: .cancel) { }
+            Button("删除", role: .destructive) {
+                if let entry = store.entry(for: date) {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isDeletingEntry = true
                     }
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                    store.delete(entry)
+                    dismiss()
+                }
             }
+        } message: {
+            Text("删除后，照片、天气和心情都会从这一天移除。")
         }
         .toolbar {
             if entry != nil || detailImage != nil {
@@ -149,6 +159,9 @@ struct EntryDetailView: View {
         .task(id: entry?.photoFilename) {
             await loadDetailImage()
         }
+        .task(id: weatherBackfillTaskID) {
+            await backfillWeatherDetailsIfNeeded()
+        }
         .sheet(isPresented: $isExportSheetPresented) {
             if let entry, let image = detailImage {
                 ExportPhotoView(entry: entry, image: image) { exportedImage in
@@ -174,21 +187,108 @@ struct EntryDetailView: View {
         }
     }
 
-    @MainActor
+    private var weatherBackfillTaskID: String {
+        guard let entry else { return "empty" }
+        let signature = entry.weather.map {
+            "\($0.fetchedAt.timeIntervalSince1970)-\($0.visibility ?? -1)-\($0.aqi ?? -1)-\($0.aerosolOpticalDepth ?? -1)"
+        } ?? "no-weather"
+        return "\(entry.id.uuidString)-\(signature)"
+    }
+
     private func loadDetailImage() async {
         guard let url = detailImageURL else {
             detailImage = nil
             return
         }
 
-        let loadedImage = await Task.detached(priority: .userInitiated) {
-            UIImage(contentsOfFile: url.path)
-        }.value
+        let screenWidth = UIScreen.main.bounds.width
+        let targetSize = CGSize(width: screenWidth, height: 420)
+        let loadedImage = await PhotoImageCache.shared.image(for: url, targetSize: targetSize, scale: UIScreen.main.scale)
 
         guard detailImageURL == url else { return }
         detailImage = loadedImage
     }
 
+    @MainActor
+    private func backfillWeatherDetailsIfNeeded() async {
+        guard let entry,
+              let weather = entry.weather,
+              weather.needsDetailBackfill,
+              let location = entry.photoLocation,
+              !isBackfillingWeatherDetails else {
+            return
+        }
+
+        isBackfillingWeatherDetails = true
+        defer { isBackfillingWeatherDetails = false }
+
+        do {
+            let refreshedWeather = try await WeatherService().weather(
+                for: CLLocationCoordinate2D(latitude: location.latitude, longitude: location.longitude)
+            )
+            var updatedEntry = entry
+            updatedEntry.weather = WeatherSnapshot(
+                temperature: weather.temperature,
+                windSpeed: weather.windSpeed,
+                weatherCode: weather.weatherCode,
+                fetchedAt: weather.fetchedAt,
+                visibility: refreshedWeather.visibility,
+                aqi: refreshedWeather.aqi,
+                aerosolOpticalDepth: refreshedWeather.aerosolOpticalDepth
+            )
+            _ = try? await store.upsert(updatedEntry, imageData: nil)
+        } catch {
+            // Keep detail view quiet if only the supplemental metrics fail.
+        }
+    }
+
+}
+
+private struct WeatherDetailMetricsView: View {
+    let weather: WeatherSnapshot
+    let isRefreshing: Bool
+
+    var body: some View {
+        VStack(spacing: 10) {
+            LabeledContent("AQI") {
+                Text(weather.aqiText)
+                    .foregroundStyle(metricColor(weather.aqi))
+            }
+
+            LabeledContent("能见度") {
+                Text(weather.visibilityText)
+                    .foregroundStyle(.secondary)
+            }
+
+            LabeledContent("AOD 气溶胶") {
+                Text(weather.aerosolOpticalDepthText)
+                    .foregroundStyle(.secondary)
+            }
+
+            if isRefreshing {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在补全天气细节...")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private func metricColor(_ aqi: Double?) -> Color {
+        guard let aqi else { return .secondary }
+        switch aqi {
+        case ..<20: return Color.green
+        case ..<40: return Color.mint
+        case ..<60: return Color.yellow
+        case ..<80: return Color.orange
+        case ..<100: return Color.red
+        default: return Color.purple
+        }
+    }
 }
 
 private struct ExportPhotoView: View {
@@ -209,7 +309,7 @@ private struct ExportPhotoView: View {
                             .tag(style)
                     }
                 }
-                .pickerStyle(.segmented)
+                .pickerStyle(.menu)
                 .padding(.horizontal, 16)
 
                 ScrollView {
@@ -218,7 +318,7 @@ private struct ExportPhotoView: View {
                             Image(uiImage: renderedPreview)
                                 .resizable()
                                 .scaledToFit()
-                                .clipShape(RoundedRectangle(cornerRadius: 14))
+                                .clipShape(RoundedRectangle(cornerRadius: AppRadius.standard))
                                 .shadow(color: .black.opacity(0.16), radius: 18, y: 8)
                         }
 
@@ -239,15 +339,15 @@ private struct ExportPhotoView: View {
                 } label: {
                     Label("导出到相册", systemImage: "square.and.arrow.down")
                         .font(.headline)
-                        .foregroundStyle(.black)
+                        .foregroundStyle(Color.black)
                         .frame(maxWidth: .infinity)
                         .frame(height: 50)
                         .background(
-                            RoundedRectangle(cornerRadius: 15)
-                                .fill(Color(red: 1.0, green: 0.82, blue: 0.24))
+                            RoundedRectangle(cornerRadius: AppRadius.primary)
+                                .fill(Color.brandYellow)
                         )
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.pressableCard(cornerRadius: AppRadius.primary, pressedScale: 0.98, overlayColor: .black.opacity(0.1)))
                 .disabled(renderedPreview == nil || isRenderingPreview)
                 .opacity(renderedPreview == nil || isRenderingPreview ? 0.55 : 1)
                 .padding(.horizontal, 16)
@@ -282,6 +382,10 @@ private struct ExportPhotoView: View {
                 rendered = ExportImageRenderer.polaroid(image: image, entry: entry)
             case .colorwalk:
                 rendered = ExportImageRenderer.colorwalk(image: image, entry: entry)
+            case .postcard:
+                rendered = ExportImageRenderer.postcard(image: image, entry: entry)
+            case .film:
+                rendered = ExportImageRenderer.film(image: image, entry: entry)
             }
 
             DispatchQueue.main.async {
@@ -297,6 +401,8 @@ private enum ExportStyle: String, CaseIterable, Identifiable {
     case original
     case polaroid
     case colorwalk
+    case postcard
+    case film
 
     var id: String { rawValue }
 
@@ -305,6 +411,8 @@ private enum ExportStyle: String, CaseIterable, Identifiable {
         case .original: "原图"
         case .polaroid: "拍立得"
         case .colorwalk: "Colorwalk"
+        case .postcard: "天气明信片"
+        case .film: "胶片边框"
         }
     }
 }
@@ -365,13 +473,48 @@ private enum ExportImageRenderer {
         }
     }
 
-    private static func draw(_ image: UIImage, aspectFillIn rect: CGRect) {
+    static func postcard(image: UIImage, entry: DailyEntry) -> UIImage {
+        let size = CGSize(width: 1800, height: 1200)
+        let margin: CGFloat = 86
+        let photoRect = CGRect(x: margin, y: margin, width: 1060, height: size.height - margin * 2)
+        let textRect = CGRect(x: photoRect.maxX + 76, y: margin + 34, width: size.width - photoRect.maxX - margin - 76, height: size.height - margin * 2 - 68)
+
+        return UIGraphicsImageRenderer(size: size).image { context in
+            UIColor(red: 0.98, green: 0.97, blue: 0.93, alpha: 1).setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+
+            UIColor(red: 0.88, green: 0.84, blue: 0.76, alpha: 1).setStroke()
+            UIBezierPath(roundedRect: CGRect(origin: CGPoint(x: 36, y: 36), size: CGSize(width: size.width - 72, height: size.height - 72)), cornerRadius: 12).stroke()
+
+            draw(image, aspectFillIn: photoRect, cornerRadius: 10)
+            drawPostcardCaption(for: entry, in: textRect)
+        }
+    }
+
+    static func film(image: UIImage, entry: DailyEntry) -> UIImage {
+        let size = CGSize(width: 1600, height: 2000)
+        let frameRect = CGRect(x: 110, y: 96, width: size.width - 220, height: size.height - 192)
+        let photoRect = frameRect.insetBy(dx: 96, dy: 140)
+
+        return UIGraphicsImageRenderer(size: size).image { context in
+            UIColor.black.setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+
+            drawFilmPerforations(in: frameRect)
+            draw(image, aspectFillIn: photoRect, cornerRadius: 4)
+
+            let captionRect = CGRect(x: photoRect.minX, y: photoRect.maxY + 42, width: photoRect.width, height: 120)
+            drawFilmCaption(for: entry, in: captionRect)
+        }
+    }
+
+    private static func draw(_ image: UIImage, aspectFillIn rect: CGRect, cornerRadius: CGFloat = 8) {
         let imageSize = image.size
         let scale = max(rect.width / max(imageSize.width, 1), rect.height / max(imageSize.height, 1))
         let size = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
         let origin = CGPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2)
         UIGraphicsGetCurrentContext()?.saveGState()
-        let clippingPath = UIBezierPath(roundedRect: rect, cornerRadius: 8)
+        let clippingPath = UIBezierPath(roundedRect: rect, cornerRadius: cornerRadius)
         clippingPath.addClip()
         image.draw(in: CGRect(origin: origin, size: size))
         UIGraphicsGetCurrentContext()?.restoreGState()
@@ -430,6 +573,73 @@ private enum ExportImageRenderer {
                 color: textColor.withAlphaComponent(0.82),
                 lineLimit: 1
             )
+        }
+    }
+
+    private static func drawPostcardCaption(for entry: DailyEntry, in rect: CGRect) {
+        let date = entry.date.formatted(.dateTime.year().month().day().weekday())
+        let weatherText = entry.weather.map {
+            "\($0.summary)  \($0.temperature.formatted(.number.precision(.fractionLength(0))))°C"
+        } ?? "WeatherMood365"
+        let note = entry.note.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        drawText(
+            date,
+            in: CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: 72),
+            font: UIFont.systemFont(ofSize: 48, weight: .semibold),
+            color: UIColor(red: 0.18, green: 0.22, blue: 0.25, alpha: 1)
+        )
+        drawText(
+            weatherText,
+            in: CGRect(x: rect.minX, y: rect.minY + 96, width: rect.width, height: 58),
+            font: UIFont.systemFont(ofSize: 34, weight: .medium),
+                            color: UIColor.appAccent
+        )
+
+        let linePath = UIBezierPath()
+        linePath.move(to: CGPoint(x: rect.minX, y: rect.minY + 190))
+        linePath.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + 190))
+        UIColor(red: 0.82, green: 0.78, blue: 0.69, alpha: 1).setStroke()
+        linePath.lineWidth = 2
+        linePath.stroke()
+
+        if !note.isEmpty {
+            drawText(
+                note,
+                in: CGRect(x: rect.minX, y: rect.minY + 230, width: rect.width, height: 260),
+                font: UIFont.systemFont(ofSize: 36, weight: .regular),
+                color: UIColor.black.withAlphaComponent(0.74),
+                lineLimit: 4
+            )
+        }
+
+        drawText(
+            entry.mood.title,
+            in: CGRect(x: rect.minX, y: rect.maxY - 82, width: rect.width, height: 60),
+            font: UIFont.systemFont(ofSize: 34, weight: .semibold),
+            color: UIColor.black.withAlphaComponent(0.62)
+        )
+    }
+
+    private static func drawFilmCaption(for entry: DailyEntry, in rect: CGRect) {
+        let date = entry.date.formatted(.dateTime.year().month().day())
+        let weatherText = entry.weather.map { "  \($0.summary)" } ?? ""
+        drawText(
+            "\(date)\(weatherText)",
+            in: rect,
+            font: UIFont.monospacedSystemFont(ofSize: 32, weight: .medium),
+            color: UIColor(red: 0.95, green: 0.78, blue: 0.35, alpha: 1)
+        )
+    }
+
+    private static func drawFilmPerforations(in rect: CGRect) {
+        UIColor(red: 0.95, green: 0.92, blue: 0.82, alpha: 1).setFill()
+        let holeSize = CGSize(width: 54, height: 36)
+        let rows = 14
+        for index in 0..<rows {
+            let y = rect.minY + 44 + CGFloat(index) * ((rect.height - 88) / CGFloat(rows - 1))
+            UIBezierPath(roundedRect: CGRect(x: rect.minX + 16, y: y, width: holeSize.width, height: holeSize.height), cornerRadius: 7).fill()
+            UIBezierPath(roundedRect: CGRect(x: rect.maxX - 16 - holeSize.width, y: y, width: holeSize.width, height: holeSize.height), cornerRadius: 7).fill()
         }
     }
 
@@ -509,129 +719,3 @@ private extension UIColor {
     }
 }
 
-private struct DeleteConfirmationOverlay: View {
-    let onCancel: () -> Void
-    let onDelete: () -> Void
-
-    @State private var isDeleting = false
-    @State private var isContentVisible = true
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.22)
-                .ignoresSafeArea()
-                .onTapGesture {
-                    guard !isDeleting else { return }
-                    onCancel()
-                }
-
-            VStack(spacing: 20) {
-                VStack(spacing: 8) {
-                    Text("删除这条记录？")
-                        .font(.title3.weight(.semibold))
-
-                    Text("删除后，照片、天气和心情都会从这一天移除。")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .lineLimit(3)
-                }
-
-                HStack(spacing: 10) {
-                    Button {
-                        onCancel()
-                    } label: {
-                        Text("取消")
-                            .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 46)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isDeleting)
-                    .foregroundStyle(.primary)
-                    .background(
-                        RoundedRectangle(cornerRadius: 14)
-                            .fill(Color(.systemBackground))
-                    )
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 14)
-                            .stroke(.secondary.opacity(0.24), lineWidth: 1)
-                    }
-
-                    Button(role: .destructive) {
-                        deleteWithFeedback()
-                    } label: {
-                        ZStack {
-                            Text("删除")
-                                .opacity(isDeleting ? 0 : 1)
-
-                            if isDeleting {
-                                ProgressView()
-                                    .tint(.white)
-                            }
-                        }
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 46)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isDeleting)
-                    .foregroundStyle(.white)
-                    .background(
-                        RoundedRectangle(cornerRadius: 14)
-                            .fill(.red)
-                    )
-                }
-            }
-            .padding(22)
-            .frame(maxWidth: 330)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
-            .overlay {
-                RoundedRectangle(cornerRadius: 24)
-                    .stroke(.white.opacity(0.28), lineWidth: 1)
-            }
-            .shadow(color: .black.opacity(0.16), radius: 24, y: 12)
-            .padding(.horizontal, 24)
-            .scaleEffect(isContentVisible ? 1 : 0.94)
-            .opacity(isContentVisible ? 1 : 0)
-        }
-    }
-
-    private func deleteWithFeedback() {
-        guard !isDeleting else { return }
-        isDeleting = true
-        withAnimation(.easeInOut(duration: 0.18)) {
-            isContentVisible = false
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.34) {
-            onDelete()
-        }
-    }
-}
-
-private struct ImagePreviewView: View {
-    @Environment(\.dismiss) private var dismiss
-    let image: UIImage
-
-    var body: some View {
-        NavigationStack {
-            ZStack {
-                Color.black.ignoresSafeArea()
-
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .ignoresSafeArea()
-            }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("关闭") {
-                        dismiss()
-                    }
-                    .foregroundStyle(.white)
-                }
-            }
-        }
-    }
-}

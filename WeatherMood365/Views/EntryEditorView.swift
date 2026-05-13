@@ -5,6 +5,7 @@ struct EntryEditorView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var store: EntryStore
 
+    @AppStorage(WeatherPhotoLibraryService.syncToLibraryEnabledKey) private var savePhotoCopyToSystemLibrary = false
     @State private var entry: DailyEntry
     @State private var selectedImageData: Data?
     @State private var isCameraPresented = false
@@ -12,9 +13,13 @@ struct EntryEditorView: View {
     @State private var weatherStatus = "尚未获取天气"
     @State private var isFetchingWeather = false
     @State private var errorMessage: String?
+    @State private var saveAlertMessage: String?
+    @State private var shouldDismissAfterAlert = false
+    @State private var isSaving = false
     @State private var didAutoFetchWeather = false
     @State private var didFetchInitialPhotoLocation = false
     @State private var selectedManualWeatherCode = -1
+    @State private var selectedPhotoSource: PickedPhoto.Source?
 
     private let allowsDateEditing: Bool
     private let titleOverride: String?
@@ -40,6 +45,7 @@ struct EntryEditorView: View {
         _entry = State(initialValue: initialEntry)
         _selectedImageData = State(initialValue: pickedPhotoData)
         _selectedManualWeatherCode = State(initialValue: entry.weather?.weatherCode ?? -1)
+        _selectedPhotoSource = State(initialValue: initialPickedPhoto?.source)
         self.allowsDateEditing = allowsDateEditing
         self.titleOverride = titleOverride
         self.shouldFetchCurrentLocationForInitialPhoto = shouldFetchCurrentLocationForInitialPhoto
@@ -68,17 +74,23 @@ struct EntryEditorView: View {
                     } label: {
                         PhotoSourceButton(title: "拍照", systemImage: "camera.fill")
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.pressableCard(cornerRadius: 12, pressedScale: 0.98, overlayColor: .black.opacity(0.1)))
 
                     Button {
                         isPhotoLibraryPresented = true
                     } label: {
                         PhotoSourceButton(title: "相册", systemImage: "photo.on.rectangle")
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.pressableCard(cornerRadius: 12, pressedScale: 0.98, overlayColor: .black.opacity(0.1)))
                 }
 
                 photoPreview
+
+                if selectedImageData != nil {
+                    Text(photoSyncDescription)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("心情") {
@@ -104,7 +116,7 @@ struct EntryEditorView: View {
                                     .stroke(entry.mood == mood ? Color.blue.opacity(0.55) : .clear, lineWidth: 1.4)
                             }
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.pressableCard(cornerRadius: 12, pressedScale: 0.98, overlayColor: .black.opacity(0.05)))
                     }
                 }
             }
@@ -128,15 +140,22 @@ struct EntryEditorView: View {
 
                 HStack(spacing: 12) {
                     if let weather = entry.weather {
-                        Label {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text("\(weather.summary) \(weather.temperature.formatted(.number.precision(.fractionLength(0))))°C")
-                                    .font(.headline)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("\(weather.summary) \(weather.temperature.formatted(.number.precision(.fractionLength(0))))°C")
+                                        .font(.headline)
+                                }
+                            } icon: {
+                                Image(systemName: weather.symbol)
+                                    .font(.title2)
+                                    .foregroundStyle(.blue)
                             }
-                        } icon: {
-                            Image(systemName: weather.symbol)
-                                .font(.title2)
-                                .foregroundStyle(.blue)
+
+                            Text("AQI \(weather.aqiText)  ·  能见度 \(weather.visibilityText)  ·  AOD \(weather.aerosolOpticalDepthText)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
                         }
                     } else {
                         Text(weatherStatus)
@@ -154,7 +173,7 @@ struct EntryEditorView: View {
                             Image(systemName: "arrow.clockwise")
                         }
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.pressableCard(cornerRadius: 12, pressedScale: 0.98, overlayColor: .black.opacity(0.1)))
                     .controlSize(.large)
                     .disabled(isFetchingWeather)
                     .accessibilityLabel("重新获取天气")
@@ -180,10 +199,32 @@ struct EntryEditorView: View {
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 Button("保存") {
-                    store.upsert(entry, imageData: selectedImageData)
-                    dismiss()
+                    Task {
+                        await saveEntry()
+                    }
                 }
+                .disabled(isSaving)
             }
+        }
+        .alert(
+            "保存结果",
+            isPresented: Binding(
+                get: { saveAlertMessage != nil },
+                set: { newValue in
+                    if !newValue {
+                        let shouldDismiss = shouldDismissAfterAlert
+                        saveAlertMessage = nil
+                        shouldDismissAfterAlert = false
+                        if shouldDismiss {
+                            dismiss()
+                        }
+                    }
+                }
+            )
+        ) {
+            Button("知道了") {}
+        } message: {
+            Text(saveAlertMessage ?? "")
         }
         .task {
             guard entry.weather == nil, !didAutoFetchWeather else { return }
@@ -201,6 +242,7 @@ struct EntryEditorView: View {
         .fullScreenCover(isPresented: $isCameraPresented) {
             CameraPickerView { pickedPhoto in
                 selectedImageData = pickedPhoto.data
+                selectedPhotoSource = pickedPhoto.source
                 if allowsDateEditing, let date = pickedPhoto.date {
                     entry.date = date
                 }
@@ -213,6 +255,7 @@ struct EntryEditorView: View {
         .fullScreenCover(isPresented: $isPhotoLibraryPresented) {
             PhotoLibraryPickerView { pickedPhoto in
                 selectedImageData = pickedPhoto.data
+                selectedPhotoSource = pickedPhoto.source
 
                 if allowsDateEditing, let date = pickedPhoto.date {
                     entry.date = date
@@ -253,6 +296,18 @@ struct EntryEditorView: View {
             (71, "雪天", "cloud.snow.fill"),
             (95, "雷雨", "cloud.bolt.rain.fill")
         ]
+    }
+
+    private var photoSyncDescription: String {
+        if selectedPhotoSource == .photoLibrary {
+            return "从系统相册选择的照片不会再次写回相册。"
+        }
+
+        if savePhotoCopyToSystemLibrary {
+            return "拍照保存后会先尝试写入系统相册，再归档到 WeatherMood365 相簿。"
+        }
+
+        return "拍照保存后默认只保存在 App 内，可在设置中开启同步到系统相册和 WeatherMood365 相簿。"
     }
 
     @ViewBuilder
@@ -309,7 +364,10 @@ struct EntryEditorView: View {
             temperature: entry.weather?.temperature ?? 0,
             windSpeed: entry.weather?.windSpeed ?? 0,
             weatherCode: code,
-            fetchedAt: Date()
+            fetchedAt: entry.weather?.fetchedAt ?? Date(),
+            visibility: entry.weather?.visibility,
+            aqi: entry.weather?.aqi,
+            aerosolOpticalDepth: entry.weather?.aerosolOpticalDepth
         )
 
         if let weather = entry.weather {
@@ -335,6 +393,37 @@ struct EntryEditorView: View {
             }
         }
     }
+
+    @MainActor
+    private func saveEntry() async {
+        guard !isSaving else { return }
+
+        isSaving = true
+        errorMessage = nil
+
+        defer {
+            isSaving = false
+        }
+
+        do {
+            let result = try await store.upsert(
+                entry,
+                imageData: selectedImageData,
+                photoSource: selectedPhotoSource
+            )
+
+            if let warningMessage = result.warningMessage {
+                saveAlertMessage = warningMessage
+                shouldDismissAfterAlert = true
+            } else {
+                dismiss()
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            saveAlertMessage = "记录未保存：\(error.localizedDescription)"
+            shouldDismissAfterAlert = false
+        }
+    }
 }
 
 private struct PhotoSourceButton: View {
@@ -344,12 +433,13 @@ private struct PhotoSourceButton: View {
     var body: some View {
         Label(title, systemImage: systemImage)
             .font(.headline)
-            .foregroundStyle(.black)
+            .foregroundStyle(Color.black)
             .frame(maxWidth: .infinity)
             .frame(height: 44)
             .background(
                 RoundedRectangle(cornerRadius: 12)
-                    .fill(Color(red: 1.0, green: 0.82, blue: 0.24))
+                    .fill(Color.brandYellow)
             )
+            .contentShape(RoundedRectangle(cornerRadius: 12))
     }
 }

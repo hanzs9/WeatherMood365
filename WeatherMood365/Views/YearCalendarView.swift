@@ -12,14 +12,15 @@ struct YearCalendarView: View {
         NavigationStack {
             ScrollViewReader { reader in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 22) {
+                    VStack(alignment: .leading, spacing: 18) {
                         yearProgress
 
                         ForEach(monthsInCurrentYear, id: \.self) { month in
                             MonthCalendarView(
                                 month: month,
                                 monthEntries: monthEntriesByIdentifier[monthIdentifier(for: month)] ?? [],
-                                refreshToken: store.version
+                                refreshToken: store.version,
+                                dayIdentifierProvider: dayIdentifier(for:)
                             )
                                 .id(monthIdentifier(for: month))
                         }
@@ -29,13 +30,14 @@ struct YearCalendarView: View {
                     .padding(.bottom, 28)
                 }
                 .onAppear {
-                    scrollToTargetMonth(with: reader, animated: false)
+                    scrollToTargetDate(with: reader, animated: false)
                 }
                 .onChange(of: jumpToken) { _, _ in
-                    scrollToTargetMonth(with: reader, animated: true)
+                    scrollToTargetDate(with: reader, animated: true)
                 }
             }
             .navigationTitle("年度日历")
+            .navigationBarTitleDisplayMode(.inline)
         }
     }
 
@@ -77,29 +79,50 @@ struct YearCalendarView: View {
         }
     }
 
+    @State private var cachedMonthEntries: [String: [DailyEntry]] = [:]
+    @State private var lastMonthEntriesVersion: Int = -1
+
     private var monthEntriesByIdentifier: [String: [DailyEntry]] {
-        Dictionary(grouping: store.sortedEntries) { entry in
-            monthIdentifier(for: entry.date)
+        if store.version != lastMonthEntriesVersion {
+            cachedMonthEntries = Dictionary(grouping: store.sortedEntries) { entry in
+                monthIdentifier(for: entry.date)
+            }
+            lastMonthEntriesVersion = store.version
         }
+        return cachedMonthEntries
     }
 
-    private func scrollToTargetMonth(with reader: ScrollViewProxy, animated: Bool) {
-        let identifier = monthIdentifier(for: targetDate)
+    private func scrollToTargetDate(with reader: ScrollViewProxy, animated: Bool) {
+        let identifier = targetDateIsInCurrentYear
+            ? dayIdentifier(for: targetDate)
+            : monthIdentifier(for: targetDate)
+        let anchor = targetDateIsInCurrentYear
+            ? UnitPoint(x: 0.5, y: 0.68)
+            : UnitPoint.top
 
         DispatchQueue.main.async {
             if animated {
                 withAnimation(.easeInOut(duration: 0.28)) {
-                    reader.scrollTo(identifier, anchor: .top)
+                    reader.scrollTo(identifier, anchor: anchor)
                 }
             } else {
-                reader.scrollTo(identifier, anchor: .top)
+                reader.scrollTo(identifier, anchor: anchor)
             }
         }
+    }
+
+    private var targetDateIsInCurrentYear: Bool {
+        calendar.component(.year, from: targetDate) == calendar.component(.year, from: Date())
     }
 
     private func monthIdentifier(for date: Date) -> String {
         let components = calendar.dateComponents([.year, .month], from: date)
         return "\(components.year ?? 0)-\(components.month ?? 0)"
+    }
+
+    private func dayIdentifier(for date: Date) -> String {
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        return "\(components.year ?? 0)-\(components.month ?? 0)-\(components.day ?? 0)"
     }
 }
 
@@ -107,9 +130,11 @@ private struct MonthCalendarView: View {
     let month: Date
     let monthEntries: [DailyEntry]
     let refreshToken: Int
+    let dayIdentifierProvider: (Date) -> String
 
     private let calendar = Calendar.current
     private let spacing: CGFloat = 8
+    private let cellAspectRatio: CGFloat = 1.25
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -130,14 +155,18 @@ private struct MonthCalendarView: View {
                         }
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.blue)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .contentShape(RoundedRectangle(cornerRadius: AppRadius.standard))
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.pressableCard(cornerRadius: AppRadius.standard, pressedScale: 0.98, overlayColor: .blue.opacity(0.08)))
                 }
             }
 
             GeometryReader { proxy in
-                let cellSize = max(44, (proxy.size.width - spacing * 6) / 7)
-                let columns = Array(repeating: GridItem(.fixed(cellSize), spacing: spacing), count: 7)
+                let cellWidth = max(42, (proxy.size.width - spacing * 6) / 7)
+                let cellHeight = cellWidth * cellAspectRatio
+                let columns = Array(repeating: GridItem(.fixed(cellWidth), spacing: spacing), count: 7)
                 let entriesByDay = entriesByDayMap
 
                 LazyVGrid(columns: columns, alignment: .leading, spacing: spacing) {
@@ -145,7 +174,7 @@ private struct MonthCalendarView: View {
                         Text(symbol)
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
-                            .frame(width: cellSize, height: 20)
+                            .frame(width: cellWidth, height: 18)
                     }
 
                     ForEach(monthCells, id: \.self) { date in
@@ -153,12 +182,17 @@ private struct MonthCalendarView: View {
                             NavigationLink {
                                 EntryDetailView(date: date)
                             } label: {
-                                dayCell(for: date, entriesByDay: entriesByDay, size: cellSize)
+                                dayCell(
+                                    for: date,
+                                    entriesByDay: entriesByDay,
+                                    cellSize: CGSize(width: cellWidth, height: cellHeight)
+                                )
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.pressableCard(cornerRadius: 8, pressedScale: 0.975, overlayColor: .white.opacity(0.08)))
+                            .id(dayIdentifierProvider(date))
                         } else {
                             Color.clear
-                                .frame(width: cellSize, height: cellSize)
+                                .frame(width: cellWidth, height: cellHeight)
                         }
                     }
                 }
@@ -193,10 +227,13 @@ private struct MonthCalendarView: View {
 
     private var monthGridHeight: CGFloat {
         let rows = ceil(Double(monthCells.count) / 7.0)
-        return 20 + spacing + CGFloat(rows) * 52 + CGFloat(max(rows - 1, 0)) * spacing
+        let availableWidth = UIScreen.main.bounds.width - 32
+        let cellWidth = max(42, (availableWidth - spacing * 6) / 7)
+        let cellHeight = cellWidth * cellAspectRatio
+        return 18 + spacing + CGFloat(rows) * cellHeight + CGFloat(max(rows - 1, 0)) * spacing
     }
 
-    private func dayCell(for date: Date, entriesByDay: [Date: DailyEntry], size: CGFloat) -> some View {
+    private func dayCell(for date: Date, entriesByDay: [Date: DailyEntry], cellSize: CGSize) -> some View {
         let entry = entriesByDay[calendar.startOfDay(for: date)]
         let isToday = calendar.isDateInToday(date)
         let photoURL = entry.flatMap { imageURL(for: $0) }
@@ -209,13 +246,13 @@ private struct MonthCalendarView: View {
             if let photoURL {
                 CachedPhotoView(
                     url: photoURL,
-                    targetSize: CGSize(width: size, height: size),
+                    targetSize: cellSize,
                     contentMode: .fill,
                     refreshToken: refreshToken
                 ) {
                     backgroundColor(for: entry, isToday: isToday)
                 }
-                .frame(width: size, height: size)
+                .frame(width: cellSize.width, height: cellSize.height)
                 .clipped()
 
                 LinearGradient(
@@ -248,7 +285,7 @@ private struct MonthCalendarView: View {
             .padding(5)
             .foregroundStyle(textColor(for: entry, hasPhoto: hasPhoto))
         }
-        .frame(width: size, height: size)
+        .frame(width: cellSize.width, height: cellSize.height)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay {
             RoundedRectangle(cornerRadius: 8)
@@ -313,14 +350,11 @@ private struct MonthCalendarView: View {
 }
 
 private struct MonthPreviewEntryCard: View {
+    @EnvironmentObject private var store: EntryStore
     let entry: DailyEntry
 
     private var imageURL: URL? {
-        guard let photoFilename = entry.photoFilename else { return nil }
-        return FileManager.default
-            .urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Photos", isDirectory: true)
-            .appendingPathComponent(photoFilename)
+        store.imageURL(for: entry)
     }
 
     var body: some View {
@@ -353,12 +387,12 @@ private struct MonthPreviewEntryCard: View {
         }
         .frame(maxWidth: .infinity)
         .background(.background)
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .clipShape(RoundedRectangle(cornerRadius: AppRadius.standard))
         .overlay {
-            RoundedRectangle(cornerRadius: 10)
+            RoundedRectangle(cornerRadius: AppRadius.standard)
                 .stroke(.secondary.opacity(0.16), lineWidth: 1)
         }
-        .contentShape(RoundedRectangle(cornerRadius: 10))
+        .contentShape(RoundedRectangle(cornerRadius: AppRadius.standard))
         .accessibilityLabel("\(entry.date.formatted(.dateTime.month().day()))，\(entry.weather?.summary ?? "无天气")，\(entry.mood.title)")
     }
 
@@ -425,7 +459,14 @@ private struct MonthEntriesView: View {
                     } label: {
                         MonthPreviewEntryCard(entry: entry)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.pressableCard(
+                        cornerRadius: AppRadius.standard,
+                        pressedScale: 0.98,
+                        overlayColor: .black.opacity(0.05),
+                        shadowColor: .black.opacity(0.08),
+                        shadowRadius: 10,
+                        shadowY: 4
+                    ))
                 }
             }
             .padding(16)
