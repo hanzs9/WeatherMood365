@@ -1,5 +1,26 @@
 import Foundation
+import OSLog
 import SwiftUI
+
+struct EntrySaveResult {
+    var warningMessage: String?
+    var savedToSystemLibrary = false
+    var addedToDedicatedAlbum = false
+}
+
+enum EntryStoreError: LocalizedError {
+    case photoSaveFailed
+    case entriesSaveFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .photoSaveFailed:
+            "照片保存失败，请稍后重试。"
+        case .entriesSaveFailed:
+            "记录保存失败，请稍后重试。"
+        }
+    }
+}
 
 @MainActor
 final class EntryStore: ObservableObject {
@@ -11,22 +32,27 @@ final class EntryStore: ObservableObject {
     private let fileManager = FileManager.default
     private var entriesByDay: [Date: DailyEntry] = [:]
     private let calendar = Calendar.current
+    private let saveQueue = DispatchQueue(label: "com.han.WeatherMood365.save", qos: .background)
+    private let logger = Logger(subsystem: "com.han.WeatherMood365", category: "entry-store")
 
     init() {
         load()
+        syncWidgetSnapshot()
     }
 
     func entry(for date: Date) -> DailyEntry? {
         entriesByDay[dayKey(for: date)]
     }
 
-    func upsert(_ entry: DailyEntry, imageData: Data?) {
+    func upsert(_ entry: DailyEntry, imageData: Data?, photoSource: PickedPhoto.Source? = nil) async throws -> EntrySaveResult {
+        logger.log("Starting entry save for date: \(entry.date.formatted(.iso8601.year().month().day()), privacy: .public)")
         var savedEntry = entry
+        savedEntry.updatedAt = Date()
         let existingByID = entries.first { $0.id == entry.id }
         let existingForDay = entries.first { Calendar.current.isDate($0.date, inSameDayAs: entry.date) }
 
         if let imageData {
-            savedEntry.photoFilename = savePhoto(imageData, for: entry.date)
+            savedEntry.photoFilename = try await savePhoto(imageData, for: entry.date)
         } else if savedEntry.photoFilename == nil {
             savedEntry.photoFilename = existingByID?.photoFilename ?? existingForDay?.photoFilename
         }
@@ -42,8 +68,32 @@ final class EntryStore: ObservableObject {
             $0.id == savedEntry.id || calendar.isDate($0.date, inSameDayAs: savedEntry.date)
         }
         updatedEntries.append(savedEntry)
+        try await save(entries: updatedEntries)
         applyEntries(updatedEntries)
-        save()
+        syncDailyReminder()
+        syncWidgetSnapshot()
+
+        var warningMessage: String?
+        var savedToSystemLibrary = false
+        var addedToDedicatedAlbum = false
+        if let imageData,
+           shouldSyncPhotoCopyToLibrary(for: photoSource) {
+            do {
+                let syncResult = try await syncPhotoToWeatherAlbum(imageData, for: savedEntry)
+                savedToSystemLibrary = syncResult.savedToLibrary
+                addedToDedicatedAlbum = syncResult.addedToWeatherMoodAlbum
+                warningMessage = syncResult.warningMessage
+            } catch {
+                warningMessage = "记录已保存，但同步到系统相册失败：\(error.localizedDescription)"
+            }
+        }
+
+        logger.log("Entry save completed for date: \(savedEntry.date.formatted(.iso8601.year().month().day()), privacy: .public)")
+        return EntrySaveResult(
+            warningMessage: warningMessage,
+            savedToSystemLibrary: savedToSystemLibrary,
+            addedToDedicatedAlbum: addedToDedicatedAlbum
+        )
     }
 
     func imageURL(for entry: DailyEntry) -> URL? {
@@ -68,7 +118,61 @@ final class EntryStore: ObservableObject {
             $0.id == entry.id || calendar.isDate($0.date, inSameDayAs: entry.date)
         }
         applyEntries(updatedEntries)
-        save()
+        Task {
+            do {
+                try await save(entries: updatedEntries)
+            } catch {
+                logger.error("Failed to persist deleted entries: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        syncDailyReminder()
+        syncWidgetSnapshot()
+    }
+
+    func importTextArchive(_ archive: TextArchive) -> TextArchiveImportResult {
+        var updatedEntries = entries
+        var result = TextArchiveImportResult(added: 0, updated: 0, skipped: 0)
+
+        for record in archive.records {
+            guard let date = TextArchiveService.date(from: record.date),
+                  let mood = Mood(rawValue: record.mood) else {
+                result.skipped += 1
+                continue
+            }
+
+            let weather = weatherSnapshot(from: record)
+            if let index = updatedEntries.firstIndex(where: { calendar.isDate($0.date, inSameDayAs: date) }) {
+                updatedEntries[index].date = date
+                updatedEntries[index].mood = mood
+                updatedEntries[index].note = record.note
+                updatedEntries[index].weather = weather
+                updatedEntries[index].updatedAt = Date()
+                result.updated += 1
+            } else {
+                updatedEntries.append(DailyEntry(
+                    date: date,
+                    mood: mood,
+                    note: record.note,
+                    weather: weather
+                ))
+                result.added += 1
+            }
+        }
+
+        if result.added > 0 || result.updated > 0 {
+            applyEntries(updatedEntries)
+            Task {
+                do {
+                    try await save(entries: updatedEntries)
+                } catch {
+                    logger.error("Failed to persist imported entries: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            syncDailyReminder()
+            syncWidgetSnapshot()
+        }
+
+        return result
     }
 
     private var storeURL: URL {
@@ -90,7 +194,7 @@ final class EntryStore: ObservableObject {
             let data = try Data(contentsOf: storeURL)
             applyEntries(try JSONDecoder().decode([DailyEntry].self, from: data), advanceVersion: false)
         } catch {
-            print("Failed to load entries: \(error)")
+            logger.error("Failed to load entries: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -109,29 +213,83 @@ final class EntryStore: ObservableObject {
         calendar.startOfDay(for: date)
     }
 
-    private func save() {
-        do {
-            let data = try JSONEncoder().encode(entries)
-            try data.write(to: storeURL, options: .atomic)
-        } catch {
-            print("Failed to save entries: \(error)")
+    private func save(entries: [DailyEntry]) async throws {
+        let url = storeURL
+        try await withCheckedThrowingContinuation { continuation in
+            saveQueue.async {
+                do {
+                    let data = try JSONEncoder().encode(entries)
+                    try data.write(to: url, options: .atomic)
+                    self.logger.log("Persisted \(entries.count) entries to disk")
+                    continuation.resume()
+                } catch {
+                    self.logger.error("Failed to save entries: \(error.localizedDescription, privacy: .public)")
+                    continuation.resume(throwing: EntryStoreError.entriesSaveFailed)
+                }
+            }
         }
     }
 
-    private func savePhoto(_ data: Data, for date: Date) -> String? {
-        do {
-            if !fileManager.fileExists(atPath: photosDirectory.path) {
-                try fileManager.createDirectory(at: photosDirectory, withIntermediateDirectories: true)
-            }
+    private func syncPhotoToWeatherAlbum(_ imageData: Data, for entry: DailyEntry) async throws -> PhotoLibrarySyncResult {
+        logger.log("Syncing saved photo to system library for date: \(entry.date.formatted(.iso8601.year().month().day()), privacy: .public)")
+        return try await WeatherPhotoLibraryService.shared.savePhoto(
+            data: imageData,
+            date: entry.date,
+            location: entry.photoLocation
+        )
+    }
 
-            let filename = "\(Self.filenameFormatter.string(from: date)).jpg"
-            let url = photosDirectory.appendingPathComponent(filename)
-            try data.write(to: url, options: .atomic)
-            PhotoImageCache.shared.removeImages(for: url)
-            return filename
-        } catch {
-            print("Failed to save photo: \(error)")
-            return nil
+    private func savePhoto(_ data: Data, for date: Date) async throws -> String {
+        let photosDirectory = photosDirectory
+        let filename = "\(Self.filenameFormatter.string(from: date)).jpg"
+        let url = photosDirectory.appendingPathComponent(filename)
+
+        return try await withCheckedThrowingContinuation { continuation in
+            saveQueue.async {
+                do {
+                    let fileManager = FileManager.default
+                    if !fileManager.fileExists(atPath: photosDirectory.path) {
+                        try fileManager.createDirectory(at: photosDirectory, withIntermediateDirectories: true)
+                    }
+
+                    try data.write(to: url, options: .atomic)
+                    PhotoImageCache.shared.removeImages(for: url)
+                    self.logger.log("Saved photo file to sandbox: \(filename, privacy: .public)")
+                    continuation.resume(returning: filename)
+                } catch {
+                    self.logger.error("Failed to save photo file: \(error.localizedDescription, privacy: .public)")
+                    continuation.resume(throwing: EntryStoreError.photoSaveFailed)
+                }
+            }
+        }
+    }
+
+    private func weatherSnapshot(from record: TextArchiveRecord) -> WeatherSnapshot? {
+        guard let weatherCode = record.weatherCode else { return nil }
+
+        let fetchedAt = record.weatherFetchedAt
+            .flatMap { ISO8601DateFormatter().date(from: $0) } ?? Date()
+
+        return WeatherSnapshot(
+            temperature: record.temperature ?? 0,
+            windSpeed: 0,
+            weatherCode: weatherCode,
+            fetchedAt: fetchedAt,
+            visibility: nil,
+            aqi: nil,
+            aerosolOpticalDepth: nil
+        )
+    }
+
+    private func syncDailyReminder() {
+        Task {
+            await ReminderService.shared.syncReminder(with: self)
+        }
+    }
+
+    private func syncWidgetSnapshot() {
+        WidgetSnapshotService.shared.sync(entries: entries, sortedEntries: sortedEntries) { [weak self] entry in
+            self?.imageURL(for: entry)
         }
     }
 
@@ -141,4 +299,12 @@ final class EntryStore: ObservableObject {
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter
     }()
+
+    private func shouldSyncPhotoCopyToLibrary(for source: PickedPhoto.Source?) -> Bool {
+        guard UserDefaults.standard.bool(forKey: WeatherPhotoLibraryService.syncToLibraryEnabledKey) else {
+            return false
+        }
+
+        return source == .camera
+    }
 }

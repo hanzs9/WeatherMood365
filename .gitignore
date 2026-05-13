@@ -26,3 +26,5 @@ playground.xcworkspace
 # App data exports
 *.xcappdata
 
+# Local agent/tool state
+.kilo/

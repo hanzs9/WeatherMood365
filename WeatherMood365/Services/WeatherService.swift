@@ -25,36 +25,75 @@ final class WeatherService {
         try await weather(for: CLLocationCoordinate2D(latitude: 31.2304, longitude: 121.4737))
     }
 
-    private func weather(for coordinate: CLLocationCoordinate2D) async throws -> WeatherSnapshot {
-        let url = URL(string: "https://api.open-meteo.com/v1/forecast?latitude=\(coordinate.latitude)&longitude=\(coordinate.longitude)&current=temperature_2m,wind_speed_10m,weather_code&timezone=auto")!
+    func weather(for coordinate: CLLocationCoordinate2D) async throws -> WeatherSnapshot {
+        async let forecast = Self.fetchForecast(for: coordinate)
+        async let airQuality = Self.fetchAirQuality(for: coordinate)
+
+        let forecastResponse = try await forecast
+        let airQualityResponse = try? await airQuality
+
+        return WeatherSnapshot(
+            temperature: forecastResponse.current.temperature2m,
+            windSpeed: forecastResponse.current.windSpeed10m,
+            weatherCode: forecastResponse.current.weatherCode,
+            fetchedAt: Date(),
+            visibility: forecastResponse.current.visibility,
+            aqi: airQualityResponse?.current.aqi,
+            aerosolOpticalDepth: airQualityResponse?.current.aerosolOpticalDepth
+        )
+    }
+
+    private static func fetchForecast(for coordinate: CLLocationCoordinate2D) async throws -> OpenMeteoForecastResponse {
+        let url = URL(string: "https://api.open-meteo.com/v1/forecast?latitude=\(coordinate.latitude)&longitude=\(coordinate.longitude)&current=temperature_2m,wind_speed_10m,weather_code,visibility&timezone=auto")!
         let (data, response) = try await URLSession.shared.data(from: url)
 
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             throw WeatherError.invalidResponse
         }
 
-        let decoded = try JSONDecoder().decode(OpenMeteoResponse.self, from: data)
-        return WeatherSnapshot(
-            temperature: decoded.current.temperature2m,
-            windSpeed: decoded.current.windSpeed10m,
-            weatherCode: decoded.current.weatherCode,
-            fetchedAt: Date()
-        )
+        return try JSONDecoder().decode(OpenMeteoForecastResponse.self, from: data)
+    }
+
+    private static func fetchAirQuality(for coordinate: CLLocationCoordinate2D) async throws -> OpenMeteoAirQualityResponse {
+        let url = URL(string: "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=\(coordinate.latitude)&longitude=\(coordinate.longitude)&current=european_aqi,aerosol_optical_depth&timezone=auto")!
+        let (data, response) = try await URLSession.shared.data(from: url)
+
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            throw WeatherError.invalidResponse
+        }
+
+        return try JSONDecoder().decode(OpenMeteoAirQualityResponse.self, from: data)
     }
 }
 
-private struct OpenMeteoResponse: Decodable {
+private struct OpenMeteoForecastResponse: Decodable {
     var current: Current
 
     struct Current: Decodable {
         var temperature2m: Double
         var windSpeed10m: Double
         var weatherCode: Int
+        var visibility: Double?
 
         enum CodingKeys: String, CodingKey {
             case temperature2m = "temperature_2m"
             case windSpeed10m = "wind_speed_10m"
             case weatherCode = "weather_code"
+            case visibility
+        }
+    }
+}
+
+private struct OpenMeteoAirQualityResponse: Decodable {
+    var current: Current
+
+    struct Current: Decodable {
+        var aqi: Double?
+        var aerosolOpticalDepth: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case aqi = "european_aqi"
+            case aerosolOpticalDepth = "aerosol_optical_depth"
         }
     }
 }

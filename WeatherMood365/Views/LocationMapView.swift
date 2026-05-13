@@ -9,25 +9,21 @@ struct LocationMapView: View {
     }
 
     private var initialPosition: MapCameraPosition {
-        let locations = entriesWithLocation.compactMap(\.photoLocation)
-        guard let first = locations.first else {
+        guard let anchorLocation = anchorEntry?.photoLocation else {
             return .automatic
         }
 
-        let minLatitude = locations.map(\.latitude).min() ?? first.latitude
-        let maxLatitude = locations.map(\.latitude).max() ?? first.latitude
-        let minLongitude = locations.map(\.longitude).min() ?? first.longitude
-        let maxLongitude = locations.map(\.longitude).max() ?? first.longitude
-        let latitudeDelta = max((maxLatitude - minLatitude) * 1.8, 0.05)
-        let longitudeDelta = max((maxLongitude - minLongitude) * 1.8, 0.05)
-
         return .region(MKCoordinateRegion(
             center: CLLocationCoordinate2D(
-                latitude: (minLatitude + maxLatitude) / 2,
-                longitude: (minLongitude + maxLongitude) / 2
+                latitude: anchorLocation.latitude,
+                longitude: anchorLocation.longitude
             ),
-            span: MKCoordinateSpan(latitudeDelta: latitudeDelta, longitudeDelta: longitudeDelta)
+            span: MKCoordinateSpan(latitudeDelta: 0.03, longitudeDelta: 0.03)
         ))
+    }
+
+    private var anchorEntry: DailyEntry? {
+        entriesWithLocation.first { Calendar.current.isDateInToday($0.date) } ?? entriesWithLocation.first
     }
 
     var body: some View {
@@ -39,6 +35,7 @@ struct LocationMapView: View {
                     description: Text("只有照片本身带有定位信息时，记录才会显示在地图上。")
                 )
                 .navigationTitle("地图")
+                .navigationBarTitleDisplayMode(.inline)
             } else {
                 Map(initialPosition: initialPosition) {
                     ForEach(entriesWithLocation) { entry in
@@ -52,7 +49,14 @@ struct LocationMapView: View {
                                 } label: {
                                     MapPhotoMarker(entry: entry, photoURL: store.imageURL(for: entry))
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(.pressableCard(
+                                    cornerRadius: AppRadius.primary,
+                                    pressedScale: 0.97,
+                                    overlayColor: .black.opacity(0.08),
+                                    shadowColor: .black.opacity(0.12),
+                                    shadowRadius: 10,
+                                    shadowY: 4
+                                ))
                             }
                         }
                     }
@@ -85,14 +89,14 @@ private struct MapPhotoMarker: View {
                 }
             }
             .frame(width: 72, height: 72)
-            .clipShape(RoundedRectangle(cornerRadius: 13))
+            .clipShape(RoundedRectangle(cornerRadius: AppRadius.standard))
 
             LinearGradient(
                 colors: [.clear, .black.opacity(0.58)],
                 startPoint: .center,
                 endPoint: .bottom
             )
-            .clipShape(RoundedRectangle(cornerRadius: 13))
+            .clipShape(RoundedRectangle(cornerRadius: AppRadius.standard))
 
             Text(entry.date.formatted(.dateTime.month().day()))
                 .font(.caption2.weight(.bold))
@@ -103,11 +107,12 @@ private struct MapPhotoMarker: View {
                 .padding(.bottom, 5)
         }
         .frame(width: 72, height: 72)
-        .background(.white, in: RoundedRectangle(cornerRadius: 15))
+        .background(.white, in: RoundedRectangle(cornerRadius: AppRadius.primary))
         .overlay {
-            RoundedRectangle(cornerRadius: 15)
+            RoundedRectangle(cornerRadius: AppRadius.primary)
                 .stroke(.white, lineWidth: 3)
         }
+        .contentShape(RoundedRectangle(cornerRadius: AppRadius.primary))
         .shadow(color: .black.opacity(0.25), radius: 7, x: 0, y: 4)
         .accessibilityLabel("\(entry.date.formatted(.dateTime.month().day()))的位置记录")
     }

@@ -4,9 +4,15 @@ import SwiftUI
 import UIKit
 
 struct PickedPhoto {
+    enum Source {
+        case camera
+        case photoLibrary
+    }
+
     var data: Data
     var date: Date?
     var location: PhotoLocation?
+    var source: Source
 }
 
 struct CameraPickerView: UIViewControllerRepresentable {
@@ -40,7 +46,7 @@ struct CameraPickerView: UIViewControllerRepresentable {
         ) {
             if let image = info[.originalImage] as? UIImage,
                let data = image.jpegData(compressionQuality: 0.86) {
-                parent.onPhotoPicked(PickedPhoto(data: data, date: Date(), location: nil))
+                parent.onPhotoPicked(PickedPhoto(data: data, date: Date(), location: nil, source: .camera))
             }
 
             parent.dismiss()
@@ -103,7 +109,8 @@ struct PhotoLibraryPickerView: UIViewControllerRepresentable {
             parent.onPhotoPicked(PickedPhoto(
                 data: data,
                 date: asset?.creationDate,
-                location: location
+                location: location,
+                source: .photoLibrary
             ))
             parent.dismiss()
         }
